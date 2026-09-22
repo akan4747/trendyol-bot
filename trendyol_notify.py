@@ -70,17 +70,21 @@ def trendyol_auth_header(cfg):
     }
 
 
-def send_telegram_message(cfg, text, photo_url=None):
-    """Telegram'a metin (ve varsa fotoğraf) gönderir."""
+def send_telegram_message(cfg, text, photo_url=None, reply_markup=None):
+    """Telegram'a metin (ve varsa fotoğraf, varsa buton) gönderir."""
     bot_token = cfg["telegram"]["bot_token"]
     chat_id = cfg["telegram"]["chat_id"]
+
+    extra_data = {}
+    if reply_markup:
+        extra_data["reply_markup"] = json.dumps(reply_markup)
 
     try:
         if photo_url:
             url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
             resp = requests.post(
                 url,
-                data={"chat_id": chat_id, "caption": text[:1024], "parse_mode": "HTML"},
+                data={"chat_id": chat_id, "caption": text[:1024], "parse_mode": "HTML", **extra_data},
                 params={"photo": photo_url},
                 timeout=20,
             )
@@ -92,7 +96,7 @@ def send_telegram_message(cfg, text, photo_url=None):
             resp = requests.post(
                 url,
                 data={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                      "disable_web_page_preview": False},
+                      "disable_web_page_preview": False, **extra_data},
                 timeout=20,
             )
         if not resp.ok:
@@ -102,6 +106,32 @@ def send_telegram_message(cfg, text, photo_url=None):
         # Görselli gönderim başarısız olduysa düz metinle tekrar dene
         if photo_url:
             send_telegram_message(cfg, text, photo_url=None)
+
+
+def answer_callback_query(cfg, callback_query_id, text=None):
+    """Kullanıcı bir butona (örn. 'Kargoya Verdim') bastığında, Telegram'a
+    'aldım, işledim' bilgisini gönderir. Bu sayede buton üzerindeki
+    yüklenme animasyonu kaybolur ve küçük bir onay mesajı görünür."""
+    bot_token = cfg["telegram"]["bot_token"]
+    url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+    try:
+        requests.post(
+            url,
+            data={"callback_query_id": callback_query_id, "text": text or "Kaydedildi ✅"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[TELEGRAM CALLBACK YANIT HATASI] {e}")
+
+
+def build_shipped_button(order_number):
+    """'Kargoya Verdim' butonunu oluşturur. Butona basılınca Telegram,
+    callback_data içindeki bu sipariş numarasını bize geri bildirir."""
+    return {
+        "inline_keyboard": [[
+            {"text": "📦 Kargoya Verdim", "callback_data": f"shipped:{order_number}"}
+        ]]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +382,7 @@ def format_unshipped_reminder(order, now):
         size = line.get("productSize") or line.get("productColor") or ""
         qty = line.get("quantity", 1)
         text += f"• {name} {('(' + size + ')') if size else ''} — <b>{qty} adet</b>\n"
-    text += "\nBu sipariş kargoya verildiyse, gruba şunu yaz ki hatırlatmalar dursun:\n"
-    text += f"<code>kargo çıktı {order_number}</code>"
+    text += "\nKargoya verdiysen aşağıdaki butona basman yeterli 👇"
     return text
 
 
@@ -394,15 +423,20 @@ def fetch_unshipped_orders(cfg):
 
 
 def current_reminder_interval_minutes(now):
-    """Şu anki saate göre hatırlatma sıklığını (dakika) döner.
-    13:00 öncesi None (hatırlatma yok). 13:00-15:00 arası 20 dk.
-    15:00-16:00 arası 5 dk. 16:00 sonrası yine 20 dk (siparişler onaylanana kadar)."""
+    """Şu anki güne/saate göre hatırlatma sıklığını (dakika) döner.
+    Pazar günleri hiç hatırlatma gönderilmez.
+    Diğer günlerde sadece 08:00-16:30 arası hatırlatma gönderilir.
+    15:00-16:00 arası 5 dk, geri kalan saatlerde (08:00-15:00 ve 16:00-16:30) 20 dk."""
+    if now.weekday() == 6:  # Python'da Pazartesi=0 ... Pazar=6
+        return None
+
     t = now.time()
-    t_13 = datetime.strptime("13:00", "%H:%M").time()
+    t_08 = datetime.strptime("08:00", "%H:%M").time()
     t_15 = datetime.strptime("15:00", "%H:%M").time()
     t_16 = datetime.strptime("16:00", "%H:%M").time()
+    t_1630 = datetime.strptime("16:30", "%H:%M").time()
 
-    if t < t_13:
+    if t < t_08 or t >= t_1630:
         return None
     if t_15 <= t < t_16:
         return 5
@@ -410,8 +444,9 @@ def current_reminder_interval_minutes(now):
 
 
 def get_telegram_updates(cfg, state):
-    """Telegram'daki YENİ mesajları çeker (grup dahil).
-    'kargo çıktı <sipariş no>' yazan mesajları yakalamak için kullanılır."""
+    """Telegram'daki YENİ mesajları/buton tıklamalarını çeker (grup dahil).
+    'Kargoya Verdim' butonuna basılmasını ya da 'kargo çıktı <sipariş no>'
+    yazılmasını yakalamak için kullanılır."""
     bot_token = cfg["telegram"]["bot_token"]
     offset = state.get("telegram_update_offset", 0)
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
@@ -432,12 +467,32 @@ def get_telegram_updates(cfg, state):
 
 
 def process_shipped_confirmations(cfg, state, updates):
-    """Grup içinde 'kargo çıktı <sipariş no>' yazılan mesajları bulup,
+    """Grup içinde 'Kargoya Verdim' butonuna basılan ya da
+    'kargo çıktı <sipariş no>' yazılan mesajları bulup,
     o sipariş için hatırlatmaları durdurur."""
     confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
     group_chat_id = str(cfg["telegram"]["chat_id"])
 
     for u in updates:
+        # 1) Butona basma (callback_query) kontrolü
+        cq = u.get("callback_query")
+        if cq:
+            data = cq.get("data", "") or ""
+            cq_chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+            if cq_chat_id == group_chat_id and data.startswith("shipped:"):
+                order_number = data.split("shipped:", 1)[1].strip()
+                if order_number:
+                    confirmed.add(order_number)
+                    who = cq.get("from", {}).get("first_name", "")
+                    answer_callback_query(
+                        cfg, cq.get("id"),
+                        f"✅ {order_number} kargoya verildi olarak işaretlendi"
+                    )
+                    print(f"[BİLGİ] '{order_number}' numaralı sipariş, {who} tarafından "
+                          f"'Kargoya Verdim' butonuyla onaylandı, hatırlatmalar durduruldu.")
+            continue  # callback_query'nin ayrıca 'message' metni de yok, devam etmeye gerek yok
+
+        # 2) Eski yöntem: elle 'kargo çıktı <sipariş no>' yazma (yedek olarak duruyor)
         msg = u.get("message", {})
         text = (msg.get("text") or "")
         chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -463,9 +518,9 @@ def send_unshipped_reminders(cfg, state):
     now = datetime.now()
     interval = current_reminder_interval_minutes(now)
     if interval is None:
-        return 0  # saat 13'ten önce, hatırlatma yok
+        return 0  # saat 08:00-16:30 aralığı dışında, hatırlatma yok
 
-    # Önce Telegram grubunda yeni "kargo çıktı" onayı var mı diye bak
+    # Önce Telegram grubunda yeni "Kargoya Verdim" onayı var mı diye bak
     updates = get_telegram_updates(cfg, state)
     process_shipped_confirmations(cfg, state, updates)
 
@@ -490,7 +545,11 @@ def send_unshipped_reminders(cfg, state):
                 due = True
 
         if due:
-            send_telegram_message(cfg, format_unshipped_reminder(order, now))
+            send_telegram_message(
+                cfg,
+                format_unshipped_reminder(order, now),
+                reply_markup=build_shipped_button(order_number),
+            )
             last_reminders[order_number] = now.isoformat()
             sent_count += 1
             time.sleep(1)
