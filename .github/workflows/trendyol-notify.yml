@@ -1,1 +1,41 @@
 name: Trendyol Bildirim
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Gereksinimleri kur
+        run: pip install -r requirements.txt
+
+      - name: Scripti calistir
+        env:
+          TRENDYOL_SELLER_ID: ${{ secrets.TRENDYOL_SELLER_ID }}
+          TRENDYOL_API_KEY: ${{ secrets.TRENDYOL_API_KEY }}
+          TRENDYOL_API_SECRET: ${{ secrets.TRENDYOL_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python trendyol_notify.py
+
+      - name: State kaydet
+        run: |
+          git config user.name "trendyol-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "state guncellendi"
+          git push
