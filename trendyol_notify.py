@@ -200,12 +200,16 @@ def fetch_new_claims(cfg, state):
 
 
 def fetch_new_questions(cfg, state):
-    """Müşteri sorularını (cevap bekleyenleri) çeker."""
+    """Müşteri sorularını / sipariş notlarını çeker.
+    ÖNEMLİ: Statü filtresi kasıtlı olarak kullanılmıyor — bazı sorular/notlar
+    çok hızlı 'ANSWERED' (cevaplanmış) durumuna geçebiliyor, sadece
+    'WAITING_FOR_ANSWER' filtrelersek bunları kaçırırdık. Bunun yerine HER
+    yeni soruyu (durumu ne olursa olsun) yakalıyoruz, tekrar bildirmemek için
+    'seen_question_ids' ile takip ediyoruz."""
     seller_id = cfg["trendyol"]["seller_id"]
     url = f"{TRENDYOL_BASE}/qna/sellers/{seller_id}/questions/filter"
 
     params = {
-        "status": "WAITING_FOR_ANSWER",
         "page": 0,
         "size": 50,
         "orderByField": "CreatedDate",
@@ -254,6 +258,30 @@ def find_order_by_number(cfg, order_number):
 # Mesaj biçimlendirme
 # ---------------------------------------------------------------------------
 
+def clean_product_name(name, max_len=45):
+    """Ürün adını kısaltır (çok uzun ürün başlıklarını sadeleştirmek için)."""
+    name = (name or "Ürün").strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip() + "…"
+    return name
+
+
+def format_product_line(line):
+    """Tek bir ürün satırını, boy/beden bilgisi KALIN ve her zaman görünür
+    şekilde, kısa ve tutarlı bir formatta döner."""
+    name = clean_product_name(line.get("productName", "Ürün"))
+    size = (line.get("productSize") or line.get("productColor") or "").strip()
+    qty = line.get("quantity", 1)
+    barcode = line.get("barcode", "")
+
+    size_suffix = f" <b>({size})</b>" if size else ""
+
+    result = f"▫️ {name}{size_suffix} — <b>{qty} adet</b>"
+    if barcode:
+        result += f"\n    <code>{barcode}</code>"
+    return result
+
+
 def format_order_message(pkg):
     order_number = pkg.get("orderNumber", "—")
     lines = pkg.get("lines", [])
@@ -262,27 +290,24 @@ def format_order_message(pkg):
     cargo_tracking_number = pkg.get("cargoTrackingNumber", "")
     cargo_provider = pkg.get("cargoProviderName", "")
 
-    text = f"🆕 <b>YENİ SİPARİŞ</b>\n"
-    text += f"Sipariş No: <b>{order_number}</b>\n"
+    text = "🆕 <b>YENİ SİPARİŞ</b>\n"
+    text += f"№ <b>{order_number}</b>"
     if customer:
-        text += f"Müşteri: {customer}\n"
-    text += f"Tutar: {total} TL\n"
+        text += f" · {customer}"
+    text += f" · {total} TL\n"
+
     if cargo_tracking_number:
-        text += f"Kargo Takip No: <b>{cargo_tracking_number}</b>"
+        text += f"🚚 {cargo_tracking_number}"
         if cargo_provider:
-            text += f" ({cargo_provider})"
+            text += f" · {cargo_provider}"
         text += "\n"
     else:
-        text += "Kargo Takip No: henüz atanmamış\n"
-    text += "\n<b>Ürünler:</b>\n"
-    for line in lines:
-        name = line.get("productName", "Ürün")
-        size = line.get("productSize") or line.get("productColor") or ""
-        qty = line.get("quantity", 1)
-        barcode = line.get("barcode", "")
-        text += f"• {name} {('(' + size + ')') if size else ''} — <b>{qty} adet</b>\n"
-        if barcode:
-            text += f"   Barkod: {barcode}\n"
+        text += "🚚 Kargo takip no henüz atanmamış\n"
+
+    if pkg.get("giftBoxRequested"):
+        text += "🎁 Hediye paketi istendi\n"
+
+    text += "\n" + "\n".join(format_product_line(line) for line in lines)
     return text
 
 
@@ -292,13 +317,12 @@ def format_claim_message(claim):
     order_number = claim.get("orderNumber", "—")
     items = claim.get("items", [])
 
-    text = f"🔁 <b>ÜRÜN DEĞİŞİKLİĞİ / İADE TALEBİ</b>\n"
-    text += f"Talep No: {claim_id}\n"
-    text += f"Sipariş No: {order_number}\n\n"
+    text = "🔁 <b>ÜRÜN DEĞİŞİKLİĞİ / İADE TALEBİ</b>\n"
+    text += f"№ <b>{order_number}</b> · Talep {claim_id}\n\n"
     for item in items:
         reason = item.get("claimItems", [{}])[0].get("reason", {}).get("name", "Belirtilmemiş")
-        product = item.get("orderLine", {}).get("productName", "Ürün")
-        text += f"• {product}\n  Sebep: {reason}\n"
+        product = clean_product_name(item.get("orderLine", {}).get("productName", "Ürün"))
+        text += f"▫️ {product}\n    Sebep: {reason}\n"
     return text
 
 
@@ -314,12 +338,12 @@ def extract_order_number(text):
 
 
 def format_question_message(q, cfg=None):
-    product = q.get("productName", "Ürün")
+    product = clean_product_name(q.get("productName", "Ürün"))
     question_text = q.get("text", "")
 
-    text = f"❓ <b>YENİ MÜŞTERİ SORUSU</b>\n"
+    text = "❓ <b>MÜŞTERİ SORUSU / NOTU</b>\n"
     text += f"Ürün: <b>{product}</b>\n"
-    text += f"Soru: {question_text}\n"
+    text += f"💬 {question_text}\n"
 
     # Soru metninde 6+ haneli bir sipariş numarası var mı diye bak.
     # Varsa, o siparişi Trendyol'dan otomatik çekip altına ekle.
@@ -327,30 +351,20 @@ def format_question_message(q, cfg=None):
     if order_number and cfg is not None:
         order = find_order_by_number(cfg, order_number)
         if order:
-            text += f"\n📦 <b>Eşleşen Sipariş Bulundu — No: {order_number}</b>\n"
+            text += f"\n📦 <b>Eşleşen Sipariş — № {order_number}</b>\n"
             customer = f"{order.get('customerFirstName','')} {order.get('customerLastName','')}".strip()
             if customer:
-                text += f"Müşteri: {customer}\n"
+                text += f"{customer}"
             cargo_tracking_number = order.get("cargoTrackingNumber", "")
             cargo_provider = order.get("cargoProviderName", "")
             if cargo_tracking_number:
-                text += f"Kargo Takip No: <b>{cargo_tracking_number}</b>"
+                text += f" · 🚚 {cargo_tracking_number}"
                 if cargo_provider:
                     text += f" ({cargo_provider})"
-                text += "\n"
-            else:
-                text += "Kargo Takip No: henüz atanmamış\n"
-            for line in order.get("lines", []):
-                name = line.get("productName", "Ürün")
-                size = line.get("productSize") or line.get("productColor") or ""
-                qty = line.get("quantity", 1)
-                barcode = line.get("barcode", "")
-                text += f"• {name} {('(' + size + ')') if size else ''} — <b>{qty} adet</b>\n"
-                if barcode:
-                    text += f"   Barkod: {barcode}\n"
+            text += "\n"
+            text += "\n".join(format_product_line(line) for line in order.get("lines", []))
         else:
-            text += f"\n⚠️ Soruda {order_number} numaralı bir sipariş numarası geçiyor gibi görünüyor, "
-            text += "ama sistemde bu numarayla eşleşen bir sipariş bulunamadı — elle kontrol etmen gerekebilir.\n"
+            text += f"\n⚠️ {order_number} numaralı sipariş bulunamadı, elle kontrol etmen gerekebilir.\n"
 
     return text, q.get("imageUrl")
 
@@ -361,22 +375,18 @@ def format_unshipped_reminder(order, now):
     cargo_tracking_number = order.get("cargoTrackingNumber", "")
     cargo_provider = order.get("cargoProviderName", "")
 
-    text = f"⏰ <b>KARGOLANMAMIŞ SİPARİŞ UYARISI</b> ({now.strftime('%H:%M')})\n"
-    text += f"Sipariş No: <b>{order_number}</b>\n"
+    text = f"⏰ <b>KARGOLANMAMIŞ SİPARİŞ</b> ({now.strftime('%H:%M')})\n"
+    text += f"№ <b>{order_number}</b>\n"
     if cargo_tracking_number:
-        text += f"Kargo Takip No: <b>{cargo_tracking_number}</b>"
+        text += f"🚚 {cargo_tracking_number}"
         if cargo_provider:
-            text += f" ({cargo_provider})"
+            text += f" · {cargo_provider}"
         text += "\n"
     else:
-        text += "Kargo Takip No: henüz atanmamış\n"
-    text += "\n"
-    for line in lines:
-        name = line.get("productName", "Ürün")
-        size = line.get("productSize") or line.get("productColor") or ""
-        qty = line.get("quantity", 1)
-        text += f"• {name} {('(' + size + ')') if size else ''} — <b>{qty} adet</b>\n"
-    text += "\nKargoya verdiysen aşağıdaki butona basman yeterli 👇"
+        text += "🚚 Kargo takip no henüz atanmamış\n"
+
+    text += "\n" + "\n".join(format_product_line(line) for line in lines)
+    text += "\n\nKargoya verdiysen aşağıdaki butona basman yeterli 👇"
     return text
 
 
@@ -655,6 +665,34 @@ def debug_print_all_questions(cfg, state):
     state["debug_questions_printed"] = True
 
 
+def migrate_seed_existing_questions(cfg, state):
+    """Statü filtresini kaldırdığımız için, geçmişte zaten var olan
+    (özellikle 'ANSWERED' durumundaki) soruların hepsi birden 'yeni' sayılıp
+    Telegram'a art arda düşmesin diye, bir kereliğine mevcut soruları
+    bildirim GÖNDERMEDEN 'görülmüş' olarak işaretler."""
+    if state.get("questions_migration_done"):
+        return
+
+    seller_id = cfg["trendyol"]["seller_id"]
+    url = f"{TRENDYOL_BASE}/qna/sellers/{seller_id}/questions/filter"
+    params = {"page": 0, "size": 200, "orderByField": "CreatedDate", "orderByDirection": "DESC"}
+
+    try:
+        resp = requests.get(url, headers=trendyol_auth_header(cfg), params=params, timeout=30)
+        if resp.ok:
+            content = resp.json().get("content", [])
+            seen_ids = set(state.get("seen_question_ids", []))
+            for q in content:
+                seen_ids.add(str(q.get("id")))
+            state["seen_question_ids"] = list(seen_ids)[-2000:]
+            print(f"[BİLGİ] Geçiş tamamlandı: {len(content)} mevcut soru/not, "
+                  f"bildirim gönderilmeden 'görülmüş' olarak işaretlendi.")
+    except Exception as e:
+        print(f"[GEÇİŞ HATASI] {e}")
+
+    state["questions_migration_done"] = True
+
+
 def main():
     cfg = load_config()
     state = load_json(STATE_PATH, {})
@@ -662,6 +700,7 @@ def main():
     try:
         debug_print_order_field_names(cfg, state)
         debug_print_all_questions(cfg, state)
+        migrate_seed_existing_questions(cfg, state)
 
         new_orders = fetch_new_orders(cfg, state)
         for pkg in new_orders:
