@@ -426,25 +426,31 @@ def fetch_unshipped_orders(cfg):
     return list(all_orders.values())
 
 
-def current_reminder_interval_minutes(now):
-    """Şu anki güne/saate göre hatırlatma sıklığını (dakika) döner.
-    Pazar günleri hiç hatırlatma gönderilmez.
-    Diğer günlerde sadece 08:00-16:30 arası hatırlatma gönderilir.
-    15:00-16:00 arası 5 dk, geri kalan saatlerde (08:00-15:00 ve 16:00-16:30) 20 dk."""
+def get_reminder_mode(now):
+    """Şu anki güne/saate göre ne yapılacağını belirler.
+    Pazar günleri: hiç hatırlatma yok.
+    10:30-10:35 arası: güne özel TEK SEFERLİK hatırlatma (mode='once').
+    14:00-15:00 arası: 20 dakikada bir (mode='interval', 20).
+    15:00-16:30 arası: 5 dakikada bir (mode='interval', 5).
+    Diğer tüm saatler: hiç hatırlatma yok.
+    Dönüş: (mode, interval_dakika) — mode 'none' | 'once' | 'interval'"""
     if now.weekday() == 6:  # Python'da Pazartesi=0 ... Pazar=6
-        return None
+        return ("none", None)
 
     t = now.time()
-    t_08 = datetime.strptime("08:00", "%H:%M").time()
+    t_1030 = datetime.strptime("10:30", "%H:%M").time()
+    t_1035 = datetime.strptime("10:35", "%H:%M").time()
+    t_14 = datetime.strptime("14:00", "%H:%M").time()
     t_15 = datetime.strptime("15:00", "%H:%M").time()
-    t_16 = datetime.strptime("16:00", "%H:%M").time()
     t_1630 = datetime.strptime("16:30", "%H:%M").time()
 
-    if t < t_08 or t >= t_1630:
-        return None
-    if t_15 <= t < t_16:
-        return 5
-    return 20
+    if t_1030 <= t < t_1035:
+        return ("once", None)
+    if t_14 <= t < t_15:
+        return ("interval", 20)
+    if t_15 <= t < t_1630:
+        return ("interval", 5)
+    return ("none", None)
 
 
 def get_telegram_updates(cfg, state):
@@ -516,24 +522,48 @@ def process_shipped_confirmations(cfg, state, updates):
 
 
 def send_unshipped_reminders(cfg, state):
-    """Şu anki saate göre gerekiyorsa, kargoya verilmemiş siparişler için
-    hatırlatma gönderir. Her sipariş için ayrı ayrı, en son ne zaman
-    hatırlatıldığını takip eder."""
+    """Şu anki saate/moda göre gerekiyorsa, kargoya verilmemiş siparişler için
+    hatırlatma gönderir.
+    - 'once' modunda (10:30 açılış hatırlatması), her sipariş için günde
+      SADECE BİR KERE gönderilir.
+    - 'interval' modunda (14:00-15:00 ve 15:00-16:30), her sipariş için
+      belirtilen dakika aralığında tekrar gönderilir."""
     now = datetime.now()
-    interval = current_reminder_interval_minutes(now)
-    if interval is None:
-        return 0  # saat 08:00-16:30 aralığı dışında, hatırlatma yok
+    mode, interval = get_reminder_mode(now)
+    if mode == "none":
+        return 0
 
     # Önce Telegram grubunda yeni "Kargoya Verdim" onayı var mı diye bak
     updates = get_telegram_updates(cfg, state)
     process_shipped_confirmations(cfg, state, updates)
 
     confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
-    last_reminders = state.get("last_unshipped_reminder", {})
-
     unshipped = fetch_unshipped_orders(cfg)
     sent_count = 0
 
+    if mode == "once":
+        today_str = now.strftime("%Y-%m-%d")
+        already_sent_today = set(state.get("morning_reminder_sent", {}).get(today_str, []))
+
+        for order in unshipped:
+            order_number = str(order.get("orderNumber", ""))
+            if not order_number or order_number in confirmed or order_number in already_sent_today:
+                continue
+            send_telegram_message(
+                cfg,
+                format_unshipped_reminder(order, now),
+                reply_markup=build_shipped_button(order_number),
+            )
+            already_sent_today.add(order_number)
+            sent_count += 1
+            time.sleep(1)
+
+        # Sadece bugünün kaydını tutuyoruz, eski günleri temizliyoruz
+        state["morning_reminder_sent"] = {today_str: list(already_sent_today)}
+        return sent_count
+
+    # mode == "interval"
+    last_reminders = state.get("last_unshipped_reminder", {})
     for order in unshipped:
         order_number = str(order.get("orderNumber", ""))
         if not order_number or order_number in confirmed:
