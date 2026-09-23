@@ -261,7 +261,6 @@ def format_order_message(pkg):
     customer = f"{pkg.get('customerFirstName','')} {pkg.get('customerLastName','')}".strip()
     cargo_tracking_number = pkg.get("cargoTrackingNumber", "")
     cargo_provider = pkg.get("cargoProviderName", "")
-    cargo_tracking_link = pkg.get("cargoTrackingLink", "")
 
     text = f"🆕 <b>YENİ SİPARİŞ</b>\n"
     text += f"Sipariş No: <b>{order_number}</b>\n"
@@ -273,8 +272,6 @@ def format_order_message(pkg):
         if cargo_provider:
             text += f" ({cargo_provider})"
         text += "\n"
-        if cargo_tracking_link:
-            text += f"Takip Linki: {cargo_tracking_link}\n"
     else:
         text += "Kargo Takip No: henüz atanmamış\n"
     text += "\n<b>Ürünler:</b>\n"
@@ -363,7 +360,6 @@ def format_unshipped_reminder(order, now):
     lines = order.get("lines", [])
     cargo_tracking_number = order.get("cargoTrackingNumber", "")
     cargo_provider = order.get("cargoProviderName", "")
-    cargo_tracking_link = order.get("cargoTrackingLink", "")
 
     text = f"⏰ <b>KARGOLANMAMIŞ SİPARİŞ UYARISI</b> ({now.strftime('%H:%M')})\n"
     text += f"Sipariş No: <b>{order_number}</b>\n"
@@ -372,8 +368,6 @@ def format_unshipped_reminder(order, now):
         if cargo_provider:
             text += f" ({cargo_provider})"
         text += "\n"
-        if cargo_tracking_link:
-            text += f"Takip Linki: {cargo_tracking_link}\n"
     else:
         text += "Kargo Takip No: henüz atanmamış\n"
     text += "\n"
@@ -600,11 +594,75 @@ def load_config():
     return load_json(CONFIG_PATH, {})
 
 
+def debug_print_order_field_names(cfg, state):
+    """Bir kereliğine, en güncel siparişin içindeki ALAN İSİMLERİNİ (değerleri değil,
+    sadece 'seller_id', 'orderNumber' gibi anahtar isimlerini) log'a yazar.
+    Bu sayede 'sipariş notu' bilgisinin hangi alanda geldiğini, hiçbir kişisel
+    bilgiyi (isim, adres vb.) paylaşmadan bulabiliriz. Bir kez çalışıp bir daha
+    tekrar etmez."""
+    if state.get("debug_fields_printed"):
+        return
+
+    seller_id = cfg["trendyol"]["seller_id"]
+    url = f"{TRENDYOL_BASE}/order/sellers/{seller_id}/orders"
+    params = {"size": 1, "page": 0, "orderByField": "PackageLastModifiedDate",
+              "orderByDirection": "DESC"}
+    try:
+        resp = requests.get(url, headers=trendyol_auth_header(cfg), params=params, timeout=30)
+        if resp.ok:
+            content = resp.json().get("content", [])
+            if content:
+                order = content[0]
+                print("[HATA AYIKLAMA - ALAN İSİMLERİ] Sipariş üst seviye alanları:")
+                print("  " + ", ".join(sorted(order.keys())))
+                lines = order.get("lines", [])
+                if lines:
+                    print("[HATA AYIKLAMA - ALAN İSİMLERİ] Ürün satırı (lines) alanları:")
+                    print("  " + ", ".join(sorted(lines[0].keys())))
+    except Exception as e:
+        print(f"[HATA AYIKLAMA HATASI] {e}")
+
+    state["debug_fields_printed"] = True
+
+
+def debug_print_all_questions(cfg, state):
+    """Bir kereliğine, TÜM soru/notları (statü filtresi olmadan) çeker ve
+    her birinin sadece STATÜSÜNÜ ve ALAN İSİMLERİNİ log'a yazar
+    (soru metni, müşteri bilgisi gibi kişisel içerik YAZILMAZ).
+    'Sipariş notu' hangi statüde geliyor, bunu bulmak için kullanılır."""
+    if state.get("debug_questions_printed"):
+        return
+
+    seller_id = cfg["trendyol"]["seller_id"]
+    url = f"{TRENDYOL_BASE}/qna/sellers/{seller_id}/questions/filter"
+    params = {"page": 0, "size": 50, "orderByField": "CreatedDate", "orderByDirection": "DESC"}
+
+    try:
+        resp = requests.get(url, headers=trendyol_auth_header(cfg), params=params, timeout=30)
+        if resp.ok:
+            content = resp.json().get("content", [])
+            print(f"[HATA AYIKLAMA - SORULAR] Statü filtresi olmadan toplam {len(content)} kayıt bulundu.")
+            if content:
+                statuses = [str(q.get("status")) for q in content]
+                print("[HATA AYIKLAMA - SORULAR] Bulunan statüler: " + ", ".join(sorted(set(statuses))))
+                print("[HATA AYIKLAMA - SORULAR] İlk kaydın alan isimleri: "
+                      + ", ".join(sorted(content[0].keys())))
+        else:
+            print(f"[HATA AYIKLAMA - SORULAR HATASI] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[HATA AYIKLAMA - SORULAR HATASI] {e}")
+
+    state["debug_questions_printed"] = True
+
+
 def main():
     cfg = load_config()
     state = load_json(STATE_PATH, {})
 
     try:
+        debug_print_order_field_names(cfg, state)
+        debug_print_all_questions(cfg, state)
+
         new_orders = fetch_new_orders(cfg, state)
         for pkg in new_orders:
             send_telegram_message(cfg, format_order_message(pkg))
