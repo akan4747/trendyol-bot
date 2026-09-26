@@ -134,6 +134,36 @@ def build_shipped_button(order_number):
     }
 
 
+def build_shipped_confirmed_button():
+    """Onaylandıktan sonra butonun yeni (tıklanınca bir şey yapmayan) hâli."""
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Kargoya Verildi", "callback_data": "noop"}
+        ]]
+    }
+
+
+def edit_message_reply_markup(cfg, chat_id, message_id, reply_markup):
+    """Zaten gönderilmiş bir mesajın ALTINDAKİ BUTONU değiştirir
+    (örn. 'Kargoya Verdim' -> '✅ Kargoya Verildi')."""
+    bot_token = cfg["telegram"]["bot_token"]
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": json.dumps(reply_markup),
+            },
+            timeout=15,
+        )
+        if not resp.ok:
+            print(f"[TELEGRAM BUTON GÜNCELLEME HATASI] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[TELEGRAM BUTON GÜNCELLEME HATASI] {e}")
+
+
 # ---------------------------------------------------------------------------
 # Trendyol veri çekme fonksiyonları
 # ---------------------------------------------------------------------------
@@ -488,7 +518,15 @@ def process_shipped_confirmations(cfg, state, updates):
         cq = u.get("callback_query")
         if cq:
             data = cq.get("data", "") or ""
+
+            if data == "noop":
+                # Zaten '✅ Kargoya Verildi' olmuş butona tekrar basılmış, yapacak bir şey yok
+                answer_callback_query(cfg, cq.get("id"), "Bu sipariş zaten kargoya verildi olarak işaretli ✅")
+                continue
+
             cq_chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+            message_id = cq.get("message", {}).get("message_id")
+
             if cq_chat_id == group_chat_id and data.startswith("shipped:"):
                 order_number = data.split("shipped:", 1)[1].strip()
                 if order_number:
@@ -498,6 +536,11 @@ def process_shipped_confirmations(cfg, state, updates):
                         cfg, cq.get("id"),
                         f"✅ {order_number} kargoya verildi olarak işaretlendi"
                     )
+                    # Butonun görünümünü '✅ Kargoya Verildi' olarak değiştir
+                    if message_id:
+                        edit_message_reply_markup(
+                            cfg, cq_chat_id, message_id, build_shipped_confirmed_button()
+                        )
                     print(f"[BİLGİ] '{order_number}' numaralı sipariş, {who} tarafından "
                           f"'Kargoya Verdim' butonuyla onaylandı, hatırlatmalar durduruldu.")
             continue  # callback_query'nin ayrıca 'message' metni de yok, devam etmeye gerek yok
@@ -527,15 +570,20 @@ def send_unshipped_reminders(cfg, state):
     - 'once' modunda (10:30 açılış hatırlatması), her sipariş için günde
       SADECE BİR KERE gönderilir.
     - 'interval' modunda (14:00-15:00 ve 15:00-16:30), her sipariş için
-      belirtilen dakika aralığında tekrar gönderilir."""
+      belirtilen dakika aralığında tekrar gönderilir.
+    ÖNEMLİ: Telegram'daki 'Kargoya Verdim' buton tıklamaları/mesajları,
+    saat/mod ne olursa olsun HER ÇALIŞTIRMADA kontrol edilir (bu satırlar
+    kasıtlı olarak saat kontrolünden ÖNCE duruyor) — böylece biri butona
+    hatırlatma saatleri dışında basarsa bile anında işlenir."""
+    # Önce Telegram grubunda yeni "Kargoya Verdim" onayı var mı diye bak
+    # (saat/mod farketmeksizin, her zaman kontrol edilir)
+    updates = get_telegram_updates(cfg, state)
+    process_shipped_confirmations(cfg, state, updates)
+
     now = datetime.now()
     mode, interval = get_reminder_mode(now)
     if mode == "none":
         return 0
-
-    # Önce Telegram grubunda yeni "Kargoya Verdim" onayı var mı diye bak
-    updates = get_telegram_updates(cfg, state)
-    process_shipped_confirmations(cfg, state, updates)
 
     confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
     unshipped = fetch_unshipped_orders(cfg)
@@ -723,6 +771,39 @@ def migrate_seed_existing_questions(cfg, state):
     state["questions_migration_done"] = True
 
 
+def fix_missed_pending_questions(cfg, state):
+    """Bir kerelik düzeltme: geçiş (migration) sırasında yanlışlıkla
+    'görülmüş' işaretlenmiş olabilecek, ama HÂLÂ CEVAPLANMAMIŞ durumdaki
+    soruları tekrar 'görülmemiş' yapar, böylece bir sonraki taramada
+    yakalanıp Telegram'a bildirilirler."""
+    if state.get("pending_questions_fix_done"):
+        return
+
+    seller_id = cfg["trendyol"]["seller_id"]
+    url = f"{TRENDYOL_BASE}/qna/sellers/{seller_id}/questions/filter"
+    params = {"page": 0, "size": 200, "orderByField": "CreatedDate", "orderByDirection": "DESC"}
+
+    try:
+        resp = requests.get(url, headers=trendyol_auth_header(cfg), params=params, timeout=30)
+        if resp.ok:
+            content = resp.json().get("content", [])
+            seen_ids = set(state.get("seen_question_ids", []))
+            freed_count = 0
+            for q in content:
+                status = str(q.get("status", "")).upper()
+                qid = str(q.get("id"))
+                if status != "ANSWERED" and qid in seen_ids:
+                    seen_ids.discard(qid)
+                    freed_count += 1
+            state["seen_question_ids"] = list(seen_ids)
+            print(f"[BİLGİ] Düzeltme tamamlandı: {freed_count} adet hâlâ cevaplanmamış soru "
+                  f"tekrar 'yeni' olarak işaretlendi, bir sonraki adımda bildirilecek.")
+    except Exception as e:
+        print(f"[DÜZELTME HATASI] {e}")
+
+    state["pending_questions_fix_done"] = True
+
+
 def main():
     cfg = load_config()
     state = load_json(STATE_PATH, {})
@@ -731,6 +812,7 @@ def main():
         debug_print_order_field_names(cfg, state)
         debug_print_all_questions(cfg, state)
         migrate_seed_existing_questions(cfg, state)
+        fix_missed_pending_questions(cfg, state)
 
         new_orders = fetch_new_orders(cfg, state)
         for pkg in new_orders:
