@@ -29,6 +29,17 @@ import base64
 import time
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TURKEY_TZ = ZoneInfo("Europe/Istanbul")
+
+
+def now_tr():
+    """Türkiye saatiyle 'şu an'ı döner.
+    ÖNEMLİ: GitHub Actions sunucuları UTC (İngiltere) saatini kullanır,
+    normal datetime.now() kullanırsak tüm saat mantığımız (10:30, 14:00,
+    16:30 gibi) 3 saat kayar. Bu yüzden HER YERDE bu fonksiyon kullanılmalı."""
+    return datetime.now(TURKEY_TZ)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -173,8 +184,8 @@ def fetch_new_orders(cfg, state):
     seller_id = cfg["trendyol"]["seller_id"]
     url = f"{TRENDYOL_BASE}/order/sellers/{seller_id}/orders"
 
-    start_date = int((datetime.now() - timedelta(hours=1)).timestamp() * 1000)
-    end_date = int(datetime.now().timestamp() * 1000)
+    start_date = int((now_tr() - timedelta(hours=1)).timestamp() * 1000)
+    end_date = int(now_tr().timestamp() * 1000)
 
     params = {
         "startDate": start_date,
@@ -430,9 +441,9 @@ def fetch_unshipped_orders(cfg):
     seller_id = cfg["trendyol"]["seller_id"]
     url = f"{TRENDYOL_BASE}/order/sellers/{seller_id}/orders"
 
-    start_of_day = datetime.combine(datetime.now().date(), datetime.min.time())
+    start_of_day = datetime.combine(now_tr().date(), datetime.min.time())
     start_ts = int(start_of_day.timestamp() * 1000)
-    end_ts = int(datetime.now().timestamp() * 1000)
+    end_ts = int(now_tr().timestamp() * 1000)
 
     all_orders = {}
     for status in UNSHIPPED_STATUSES:
@@ -582,7 +593,7 @@ def send_unshipped_reminders(cfg, state):
     updates = get_telegram_updates(cfg, state)
     process_shipped_confirmations(cfg, state, updates)
 
-    now = datetime.now()
+    now = now_tr()
     mode, interval = get_reminder_mode(now)
     if mode == "none":
         return 0
@@ -834,7 +845,7 @@ def main():
 
         unshipped_reminder_count = send_unshipped_reminders(cfg, state)
 
-        print(f"[{datetime.now()}] Kontrol tamamlandı. "
+        print(f"[{now_tr()}] Kontrol tamamlandı. "
               f"{len(new_orders)} yeni sipariş, {len(new_claims)} yeni talep, "
               f"{len(new_questions)} yeni soru, "
               f"{unshipped_reminder_count} kargolanmamış sipariş hatırlatması bulundu.")
