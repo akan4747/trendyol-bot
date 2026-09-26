@@ -459,7 +459,10 @@ def fetch_unshipped_orders(cfg):
 def get_reminder_mode(now):
     """Şu anki güne/saate göre ne yapılacağını belirler.
     Pazar günleri: hiç hatırlatma yok.
-    10:30-10:35 arası: güne özel TEK SEFERLİK hatırlatma (mode='once').
+    10:30-14:00 arası: güne özel TEK SEFERLİK hatırlatma (mode='once') —
+      bu aralıkta script İLK ne zaman çalışırsa o an gönderir (GitHub'ın
+      zamanlayıcısı birkaç dakika gecikebildiği için dar bir pencereye
+      bağlı kalınmıyor, tüm aralık boyunca 'bugün gönderildi mi' kontrol edilir).
     14:00-15:00 arası: 20 dakikada bir (mode='interval', 20).
     15:00-16:30 arası: 5 dakikada bir (mode='interval', 5).
     Diğer tüm saatler: hiç hatırlatma yok.
@@ -469,12 +472,11 @@ def get_reminder_mode(now):
 
     t = now.time()
     t_1030 = datetime.strptime("10:30", "%H:%M").time()
-    t_1035 = datetime.strptime("10:35", "%H:%M").time()
     t_14 = datetime.strptime("14:00", "%H:%M").time()
     t_15 = datetime.strptime("15:00", "%H:%M").time()
     t_1630 = datetime.strptime("16:30", "%H:%M").time()
 
-    if t_1030 <= t < t_1035:
+    if t_1030 <= t < t_14:
         return ("once", None)
     if t_14 <= t < t_15:
         return ("interval", 20)
