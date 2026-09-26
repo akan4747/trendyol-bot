@@ -154,6 +154,49 @@ def build_shipped_confirmed_button():
     }
 
 
+def shipped_button_text(order_number):
+    """Özel klavye butonunun üzerindeki yazı. Bu yazı, mevcut
+    'kargo çıktı <no>' metin algılama sistemiyle uyumlu olacak şekilde
+    kasıtlı olarak 'kargo' ve 'çıktı' kelimelerini içeriyor — buna basınca
+    bu yazı OLDUĞU GİBİ mesaj olarak gönderilir, bot onu otomatik yakalar."""
+    return f"📦 Kargo Çıktı {order_number}"
+
+
+def build_reply_keyboard(order_numbers):
+    """Grubun mesaj yazma alanının ÜSTÜNDE duran, tıklanınca ANINDA
+    (bot'un uyanmasını beklemeden) mesaj gönderen özel klavyeyi oluşturur.
+    Her bekleyen sipariş için bir buton olur. Sipariş kalmazsa None döner
+    (klavyeyi kaldırmak için)."""
+    if not order_numbers:
+        return None
+    buttons = [[{"text": shipped_button_text(on)}] for on in order_numbers]
+    return {"keyboard": buttons, "resize_keyboard": True, "is_persistent": True}
+
+
+def remove_reply_keyboard():
+    """Özel klavyeyi kaldırır (bekleyen sipariş kalmadığında)."""
+    return {"remove_keyboard": True}
+
+
+def sync_reply_keyboard(cfg, state, pending_order_numbers):
+    """Özel klavyeyi, o an gerçekten bekleyen siparişlerle eşleşecek şekilde
+    günceller. Liste değişmediyse hiçbir şey yapmaz (gereksiz mesaj atmaz)."""
+    pending_sorted = sorted(str(x) for x in pending_order_numbers)
+    if state.get("reply_keyboard_signature") == pending_sorted:
+        return  # zaten güncel, tekrar göndermeye gerek yok
+
+    if pending_sorted:
+        markup = build_reply_keyboard(pending_sorted)
+        text = ("📋 <b>Bekleyen kargolar</b> — kargoya verdiğin siparişin "
+                "butonuna bas, mesaj otomatik gönderilsin:")
+    else:
+        markup = remove_reply_keyboard()
+        text = "✅ Şu an bekleyen kargolanmamış sipariş yok."
+
+    send_telegram_message(cfg, text, reply_markup=markup)
+    state["reply_keyboard_signature"] = pending_sorted
+
+
 def edit_message_reply_markup(cfg, chat_id, message_id, reply_markup):
     """Zaten gönderilmiş bir mesajın ALTINDAKİ BUTONU değiştirir
     (örn. 'Kargoya Verdim' -> '✅ Kargoya Verildi')."""
@@ -382,30 +425,37 @@ def format_question_message(q, cfg=None):
     product = clean_product_name(q.get("productName", "Ürün"))
     question_text = q.get("text", "")
 
-    text = "❓ <b>MÜŞTERİ SORUSU / NOTU</b>\n"
+    # Soru metninde 6+ haneli bir sipariş numarası var mı diye bak.
+    order_number = extract_order_number(question_text)
+    order = find_order_by_number(cfg, order_number) if (order_number and cfg is not None) else None
+
+    if not order_number:
+        # Sipariş numarası içermeyen SADE soru: kısa ve öz bir bildirim yeter.
+        text = "💬 <b>Yeni mesaj var</b> — cevapla\n"
+        text += f"Ürün: {product}"
+        return text, q.get("imageUrl")
+
+    # Sipariş numarası içeren istek (hediye kutusu, kişiselleştirme vb.):
+    # detaylı göster, ilgili siparişin ürünüyle birleştir.
+    text = "🎁 <b>ÖZELLEŞTİRME / SİPARİŞLE İLGİLİ MESAJ</b>\n"
     text += f"Ürün: <b>{product}</b>\n"
     text += f"💬 {question_text}\n"
 
-    # Soru metninde 6+ haneli bir sipariş numarası var mı diye bak.
-    # Varsa, o siparişi Trendyol'dan otomatik çekip altına ekle.
-    order_number = extract_order_number(question_text)
-    if order_number and cfg is not None:
-        order = find_order_by_number(cfg, order_number)
-        if order:
-            text += f"\n📦 <b>Eşleşen Sipariş — № {order_number}</b>\n"
-            customer = f"{order.get('customerFirstName','')} {order.get('customerLastName','')}".strip()
-            if customer:
-                text += f"{customer}"
-            cargo_tracking_number = order.get("cargoTrackingNumber", "")
-            cargo_provider = order.get("cargoProviderName", "")
-            if cargo_tracking_number:
-                text += f" · 🚚 {cargo_tracking_number}"
-                if cargo_provider:
-                    text += f" ({cargo_provider})"
-            text += "\n"
-            text += "\n".join(format_product_line(line) for line in order.get("lines", []))
-        else:
-            text += f"\n⚠️ {order_number} numaralı sipariş bulunamadı, elle kontrol etmen gerekebilir.\n"
+    if order:
+        text += f"\n📦 <b>Sipariş — № {order_number}</b>\n"
+        customer = f"{order.get('customerFirstName','')} {order.get('customerLastName','')}".strip()
+        if customer:
+            text += f"{customer}"
+        cargo_tracking_number = order.get("cargoTrackingNumber", "")
+        cargo_provider = order.get("cargoProviderName", "")
+        if cargo_tracking_number:
+            text += f" · 🚚 {cargo_tracking_number}"
+            if cargo_provider:
+                text += f" ({cargo_provider})"
+        text += "\n"
+        text += "\n".join(format_product_line(line) for line in order.get("lines", []))
+    else:
+        text += f"\n⚠️ {order_number} numaralı sipariş bulunamadı, elle kontrol etmen gerekebilir.\n"
 
     return text, q.get("imageUrl")
 
@@ -594,12 +644,21 @@ def send_unshipped_reminders(cfg, state):
     process_shipped_confirmations(cfg, state, updates)
 
     now = now_tr()
+    confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
+
+    # Özel klavyeyi HER ZAMAN güncel tut (saat/mod farketmeksizin) —
+    # biri butona basıp onaylayınca, klavyedeki o buton hemen kaybolsun diye.
+    unshipped = fetch_unshipped_orders(cfg)
+    pending_order_numbers = [
+        str(o.get("orderNumber", "")) for o in unshipped
+        if str(o.get("orderNumber", "")) and str(o.get("orderNumber", "")) not in confirmed
+    ]
+    sync_reply_keyboard(cfg, state, pending_order_numbers)
+
     mode, interval = get_reminder_mode(now)
     if mode == "none":
         return 0
 
-    confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
-    unshipped = fetch_unshipped_orders(cfg)
     sent_count = 0
 
     if mode == "once":
