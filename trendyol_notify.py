@@ -81,10 +81,11 @@ def trendyol_auth_header(cfg):
     }
 
 
-def send_telegram_message(cfg, text, photo_url=None, reply_markup=None):
-    """Telegram'a metin (ve varsa fotoğraf, varsa buton) gönderir."""
+def send_telegram_message(cfg, text, photo_url=None, reply_markup=None, chat_id=None):
+    """Telegram'a metin (ve varsa fotoğraf, varsa buton) gönderir.
+    chat_id verilmezse varsayılan (ana kargo) grubuna gönderir."""
     bot_token = cfg["telegram"]["bot_token"]
-    chat_id = cfg["telegram"]["chat_id"]
+    chat_id = chat_id or cfg["telegram"]["chat_id"]
 
     extra_data = {}
     if reply_markup:
@@ -154,22 +155,27 @@ def build_shipped_confirmed_button():
     }
 
 
-def shipped_button_text(order_number):
+def shipped_button_text(order_number, customer_name=""):
     """Özel klavye butonunun üzerindeki yazı. Bu yazı, mevcut
     'kargo çıktı <no>' metin algılama sistemiyle uyumlu olacak şekilde
     kasıtlı olarak 'kargo' ve 'çıktı' kelimelerini içeriyor — buna basınca
-    bu yazı OLDUĞU GİBİ mesaj olarak gönderilir, bot onu otomatik yakalar."""
-    return f"📦 Kargo Çıktı {order_number}"
+    bu yazı OLDUĞU GİBİ mesaj olarak gönderilir, bot onu otomatik yakalar.
+    Alıcı ismi de eklenir, hangi paketin hangisi olduğunu ayırt etmek kolaylaşsın diye."""
+    text = f"📦 Kargo Çıktı {order_number}"
+    if customer_name:
+        text += f" - {customer_name}"
+    return text
 
 
-def build_reply_keyboard(order_numbers):
+def build_reply_keyboard(orders_info):
     """Grubun mesaj yazma alanının ÜSTÜNDE duran, tıklanınca ANINDA
     (bot'un uyanmasını beklemeden) mesaj gönderen özel klavyeyi oluşturur.
+    orders_info: [(order_number, customer_name), ...] listesi.
     Her bekleyen sipariş için bir buton olur. Sipariş kalmazsa None döner
     (klavyeyi kaldırmak için)."""
-    if not order_numbers:
+    if not orders_info:
         return None
-    buttons = [[{"text": shipped_button_text(on)}] for on in order_numbers]
+    buttons = [[{"text": shipped_button_text(on, name)}] for on, name in orders_info]
     return {"keyboard": buttons, "resize_keyboard": True, "is_persistent": True}
 
 
@@ -178,11 +184,14 @@ def remove_reply_keyboard():
     return {"remove_keyboard": True}
 
 
-def sync_reply_keyboard(cfg, state, pending_order_numbers):
+def sync_reply_keyboard(cfg, state, pending_orders_info):
     """Özel klavyeyi, o an gerçekten bekleyen siparişlerle eşleşecek şekilde
-    günceller. Liste değişmediyse hiçbir şey yapmaz (gereksiz mesaj atmaz)."""
-    pending_sorted = sorted(str(x) for x in pending_order_numbers)
-    if state.get("reply_keyboard_signature") == pending_sorted:
+    günceller. pending_orders_info: [(order_number, customer_name), ...]
+    Liste değişmediyse hiçbir şey yapmaz (gereksiz mesaj atmaz)."""
+    pending_sorted = sorted((str(on), name) for on, name in pending_orders_info)
+    # Sadece sipariş numaralarını karşılaştırıyoruz (isim değişmez zaten, gereksiz tetiklenmesin)
+    pending_numbers_only = [on for on, _ in pending_sorted]
+    if state.get("reply_keyboard_signature") == pending_numbers_only:
         return  # zaten güncel, tekrar göndermeye gerek yok
 
     if pending_sorted:
@@ -194,7 +203,7 @@ def sync_reply_keyboard(cfg, state, pending_order_numbers):
         text = "✅ Şu an bekleyen kargolanmamış sipariş yok."
 
     send_telegram_message(cfg, text, reply_markup=markup)
-    state["reply_keyboard_signature"] = pending_sorted
+    state["reply_keyboard_signature"] = pending_numbers_only
 
 
 def edit_message_reply_markup(cfg, chat_id, message_id, reply_markup):
@@ -433,7 +442,7 @@ def format_question_message(q, cfg=None):
         # Sipariş numarası içermeyen SADE soru: kısa ve öz bir bildirim yeter.
         text = "💬 <b>Yeni mesaj var</b> — cevapla\n"
         text += f"Ürün: {product}"
-        return text, q.get("imageUrl")
+        return text, q.get("imageUrl"), False
 
     # Sipariş numarası içeren istek (hediye kutusu, kişiselleştirme vb.):
     # detaylı göster, ilgili siparişin ürünüyle birleştir.
@@ -457,7 +466,7 @@ def format_question_message(q, cfg=None):
     else:
         text += f"\n⚠️ {order_number} numaralı sipariş bulunamadı, elle kontrol etmen gerekebilir.\n"
 
-    return text, q.get("imageUrl")
+    return text, q.get("imageUrl"), bool(order)
 
 
 def format_unshipped_reminder(order, now):
@@ -649,11 +658,15 @@ def send_unshipped_reminders(cfg, state):
     # Özel klavyeyi HER ZAMAN güncel tut (saat/mod farketmeksizin) —
     # biri butona basıp onaylayınca, klavyedeki o buton hemen kaybolsun diye.
     unshipped = fetch_unshipped_orders(cfg)
-    pending_order_numbers = [
-        str(o.get("orderNumber", "")) for o in unshipped
+    pending_orders_info = [
+        (
+            str(o.get("orderNumber", "")),
+            f"{o.get('customerFirstName','')} {o.get('customerLastName','')}".strip(),
+        )
+        for o in unshipped
         if str(o.get("orderNumber", "")) and str(o.get("orderNumber", "")) not in confirmed
     ]
-    sync_reply_keyboard(cfg, state, pending_order_numbers)
+    sync_reply_keyboard(cfg, state, pending_orders_info)
 
     mode, interval = get_reminder_mode(now)
     if mode == "none":
@@ -726,6 +739,9 @@ def load_config():
     env_secret = os.environ.get("TRENDYOL_API_SECRET")
     env_bot = os.environ.get("TELEGRAM_BOT_TOKEN")
     env_chat = os.environ.get("TELEGRAM_CHAT_ID")
+    # İkinci grup: iade talepleri + sipariş numarası içermeyen basit sorular.
+    # Verilmezse (isteğe bağlı), her şey ana gruba gider (eski davranış).
+    env_chat_secondary = os.environ.get("TELEGRAM_IADE_SORU_CHAT_ID")
 
     print("[HATA AYIKLAMA] Ortam değişkenleri durumu (gerçek değerler gösterilmiyor):")
     print(f"  TRENDYOL_SELLER_ID  dolu mu: {bool(env_seller)}")
@@ -733,6 +749,7 @@ def load_config():
     print(f"  TRENDYOL_API_SECRET dolu mu: {bool(env_secret)}")
     print(f"  TELEGRAM_BOT_TOKEN  dolu mu: {bool(env_bot)}")
     print(f"  TELEGRAM_CHAT_ID    dolu mu: {bool(env_chat)}")
+    print(f"  TELEGRAM_IADE_SORU_CHAT_ID dolu mu: {bool(env_chat_secondary)} (opsiyonel)")
 
     if env_seller and env_key and env_secret and env_bot and env_chat:
         return {
@@ -744,6 +761,7 @@ def load_config():
             "telegram": {
                 "bot_token": env_bot,
                 "chat_id": env_chat,
+                "iade_soru_chat_id": env_chat_secondary or env_chat,
             },
         }
 
@@ -751,7 +769,11 @@ def load_config():
         print("HATA: Ne ortam değişkenleri (GitHub Secrets) ne de config.json bulundu.")
         sys.exit(1)
 
-    return load_json(CONFIG_PATH, {})
+    cfg = load_json(CONFIG_PATH, {})
+    # Yerel config.json'da ikinci grup tanımlı değilse, ana grubu kullan
+    if cfg.get("telegram") and not cfg["telegram"].get("iade_soru_chat_id"):
+        cfg["telegram"]["iade_soru_chat_id"] = cfg["telegram"].get("chat_id")
+    return cfg
 
 
 def debug_print_order_field_names(cfg, state):
@@ -893,13 +915,17 @@ def main():
 
         new_claims = fetch_new_claims(cfg, state)
         for claim in new_claims:
-            send_telegram_message(cfg, format_claim_message(claim))
+            send_telegram_message(cfg, format_claim_message(claim),
+                                   chat_id=cfg["telegram"]["iade_soru_chat_id"])
             time.sleep(1)
 
         new_questions = fetch_new_questions(cfg, state)
         for q in new_questions:
-            text, image_url = format_question_message(q, cfg)
-            send_telegram_message(cfg, text, photo_url=image_url)
+            text, image_url, matched_order = format_question_message(q, cfg)
+            # Sipariş numarasıyla eşleşen (özelleştirme vb.) sorular -> ana kargo grubu
+            # Basit/genel sorular -> ikinci grup (iade/soru)
+            target_chat_id = cfg["telegram"]["chat_id"] if matched_order else cfg["telegram"]["iade_soru_chat_id"]
+            send_telegram_message(cfg, text, photo_url=image_url, chat_id=target_chat_id)
             time.sleep(1)
 
         unshipped_reminder_count = send_unshipped_reminders(cfg, state)
