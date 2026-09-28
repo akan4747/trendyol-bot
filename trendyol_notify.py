@@ -24,6 +24,7 @@ KURULUM:
 
 import json
 import os
+from html import escape as html_escape
 import sys
 import base64
 import time
@@ -81,15 +82,20 @@ def trendyol_auth_header(cfg):
     }
 
 
-def send_telegram_message(cfg, text, photo_url=None, reply_markup=None, chat_id=None):
+def send_telegram_message(cfg, text, photo_url=None, reply_markup=None, chat_id=None,
+                          silent=False):
     """Telegram'a metin (ve varsa fotoğraf, varsa buton) gönderir.
-    chat_id verilmezse varsayılan (ana kargo) grubuna gönderir."""
+    chat_id verilmezse varsayılan (ana kargo) grubuna gönderir.
+    silent=True ise bildirim sesi/titreşimi olmadan gönderir.
+    Başarılıysa gönderilen mesajın numarasını (message_id), değilse None döner."""
     bot_token = cfg["telegram"]["bot_token"]
     chat_id = chat_id or cfg["telegram"]["chat_id"]
 
     extra_data = {}
     if reply_markup:
         extra_data["reply_markup"] = json.dumps(reply_markup)
+    if silent:
+        extra_data["disable_notification"] = "true"
 
     try:
         if photo_url:
@@ -108,16 +114,33 @@ def send_telegram_message(cfg, text, photo_url=None, reply_markup=None, chat_id=
             resp = requests.post(
                 url,
                 data={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                      "disable_web_page_preview": False, **extra_data},
+                      "disable_web_page_preview": True, **extra_data},
                 timeout=20,
             )
         if not resp.ok:
             print(f"[TELEGRAM HATA] {resp.status_code}: {resp.text}")
+            return None
+        return resp.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"[TELEGRAM GONDERIM HATASI] {e}")
         # Görselli gönderim başarısız olduysa düz metinle tekrar dene
         if photo_url:
-            send_telegram_message(cfg, text, photo_url=None)
+            return send_telegram_message(cfg, text, photo_url=None, reply_markup=reply_markup,
+                                         chat_id=chat_id, silent=silent)
+        return None
+
+
+def delete_telegram_message(cfg, chat_id, message_id):
+    """Daha önce gönderilmiş bir mesajı siler (örn. eski 'Bekleyen kargolar'
+    mesajını, grupta hep tek bir tane kalsın diye)."""
+    if not message_id:
+        return
+    bot_token = cfg["telegram"]["bot_token"]
+    url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
+    try:
+        requests.post(url, data={"chat_id": chat_id, "message_id": message_id}, timeout=15)
+    except Exception as e:
+        print(f"[TELEGRAM MESAJ SİLME HATASI] {e}")
 
 
 def answer_callback_query(cfg, callback_query_id, text=None):
@@ -187,7 +210,9 @@ def remove_reply_keyboard():
 def sync_reply_keyboard(cfg, state, pending_orders_info):
     """Özel klavyeyi, o an gerçekten bekleyen siparişlerle eşleşecek şekilde
     günceller. pending_orders_info: [(order_number, customer_name), ...]
-    Liste değişmediyse hiçbir şey yapmaz (gereksiz mesaj atmaz)."""
+    Liste değişmediyse hiçbir şey yapmaz (gereksiz mesaj atmaz).
+    Mesaj SESSİZ gönderilir (telefon titremez) ve bir önceki 'Bekleyen kargolar'
+    mesajı silinir — grupta hep tek bir tane kalır."""
     pending_sorted = sorted((str(on), name) for on, name in pending_orders_info)
     # Sadece sipariş numaralarını karşılaştırıyoruz (isim değişmez zaten, gereksiz tetiklenmesin)
     pending_numbers_only = [on for on, _ in pending_sorted]
@@ -202,8 +227,16 @@ def sync_reply_keyboard(cfg, state, pending_orders_info):
         markup = remove_reply_keyboard()
         text = "✅ Şu an bekleyen kargolanmamış sipariş yok."
 
-    send_telegram_message(cfg, text, reply_markup=markup)
-    state["reply_keyboard_signature"] = pending_numbers_only
+    chat_id = cfg["telegram"]["chat_id"]
+    new_message_id = send_telegram_message(cfg, text, reply_markup=markup, silent=True)
+
+    # Yeni mesaj başarıyla gittiyse, eskisini sil
+    if new_message_id:
+        old_message_id = state.get("reply_keyboard_message_id")
+        if old_message_id:
+            delete_telegram_message(cfg, chat_id, old_message_id)
+        state["reply_keyboard_message_id"] = new_message_id
+        state["reply_keyboard_signature"] = pending_numbers_only
 
 
 def edit_message_reply_markup(cfg, chat_id, message_id, reply_markup):
@@ -362,8 +395,8 @@ def clean_product_name(name, max_len=45):
 def format_product_line(line):
     """Tek bir ürün satırını, boy/beden bilgisi KALIN ve her zaman görünür
     şekilde, kısa ve tutarlı bir formatta döner."""
-    name = clean_product_name(line.get("productName", "Ürün"))
-    size = (line.get("productSize") or line.get("productColor") or "").strip()
+    name = html_escape(clean_product_name(line.get("productName", "Ürün")))
+    size = html_escape((line.get("productSize") or line.get("productColor") or "").strip())
     qty = line.get("quantity", 1)
     barcode = line.get("barcode", "")
 
@@ -448,7 +481,7 @@ def format_question_message(q, cfg=None):
     # detaylı göster, ilgili siparişin ürünüyle birleştir.
     text = "🎁 <b>ÖZELLEŞTİRME / SİPARİŞLE İLGİLİ MESAJ</b>\n"
     text += f"Ürün: <b>{product}</b>\n"
-    text += f"💬 {question_text}\n"
+    text += f"💬 {html_escape(question_text)}\n"
 
     if order:
         text += f"\n📦 <b>Sipariş — № {order_number}</b>\n"
@@ -469,30 +502,99 @@ def format_question_message(q, cfg=None):
     return text, q.get("imageUrl"), bool(order)
 
 
-def format_unshipped_reminder(order, now):
-    order_number = order.get("orderNumber", "—")
-    lines = order.get("lines", [])
-    cargo_tracking_number = order.get("cargoTrackingNumber", "")
-    cargo_provider = order.get("cargoProviderName", "")
+def collect_order_notes(cfg, pending_order_numbers):
+    """Müşteri sorularını tarar; sorunun içinde bekleyen bir siparişin numarası
+    geçiyorsa (örn. 'siparişim 11647798314, d yerine a olsun') o metni o
+    siparişin NOTU olarak döner. Dönüş: {sipariş_no: [not_metni, ...]}"""
+    import re
+    notes = {}
+    if not pending_order_numbers:
+        return notes
 
-    text = f"⏰ <b>KARGOLANMAMIŞ SİPARİŞ</b> ({now.strftime('%H:%M')})\n"
-    text += f"№ <b>{order_number}</b>\n"
-    if cargo_tracking_number:
-        text += f"🚚 {cargo_tracking_number}"
-        if cargo_provider:
-            text += f" · {cargo_provider}"
-        text += "\n"
-    else:
-        text += "🚚 Kargo takip no henüz atanmamış\n"
+    seller_id = cfg["trendyol"]["seller_id"]
+    url = f"{TRENDYOL_BASE}/qna/sellers/{seller_id}/questions/filter"
+    params = {"page": 0, "size": 100, "orderByField": "CreatedDate", "orderByDirection": "DESC"}
+    try:
+        resp = requests.get(url, headers=trendyol_auth_header(cfg), params=params, timeout=30)
+        if not resp.ok:
+            print(f"[NOT TOPLAMA HATASI] {resp.status_code}: {resp.text}")
+            return notes
+        pending = set(str(x) for x in pending_order_numbers)
+        for q in resp.json().get("content", []):
+            text = (q.get("text") or "").strip()
+            for number in re.findall(r"\d{6,}", text):
+                if number in pending:
+                    notes.setdefault(number, [])
+                    if text not in notes[number]:
+                        notes[number].append(text)
+    except Exception as e:
+        print(f"[NOT TOPLAMA HATASI] {e}")
+    return notes
 
-    text += "\n" + "\n".join(format_product_line(line) for line in lines)
-    text += "\n\nKargoya verdiysen aşağıdaki butona basman yeterli 👇"
-    return text
+
+def hours_since_order(order, now):
+    """Siparişin verilmesinden bu yana geçen saat (yaklaşık). Bilinmiyorsa None."""
+    order_date = order.get("orderDate")
+    if not order_date:
+        return None
+    try:
+        ordered_at = datetime.fromtimestamp(order_date / 1000, tz=TURKEY_TZ)
+        return int((now - ordered_at).total_seconds() // 3600)
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Kargolanmamış sipariş takibi + Telegram'dan "kargo çıktı" onayını okuma
-# ---------------------------------------------------------------------------
+def format_unshipped_summary(orders, notes_by_order, now, max_len=3500):
+    """Kargolanmamış TÜM siparişleri, tek bir toplu mesaj olarak (çok uzarsa
+    birkaç parça halinde) hazırlar. En eski sipariş en üstte (en acil olan).
+    Her siparişte: alıcı adı, sipariş no, hediye kutusu, geçen süre, kargo takip
+    no, ürünler ve varsa müşterinin özelleştirme notu görünür.
+    Dönüş: mesaj parçalarının listesi."""
+    orders = sorted(orders, key=lambda o: o.get("orderDate") or 0)
+
+    header = f"⏰ <b>{len(orders)} SİPARİŞ KARGO BEKLİYOR</b> ({now.strftime('%H:%M')})\n"
+
+    blocks = []
+    for i, order in enumerate(orders, start=1):
+        order_number = str(order.get("orderNumber", "—"))
+        customer = f"{order.get('customerFirstName','')} {order.get('customerLastName','')}".strip()
+
+        title = f"<b>{i}.</b> {html_escape(customer) or 'Alıcı bilinmiyor'} · <b>№ {order_number}</b>"
+        if order.get("giftBoxRequested"):
+            title += " 🎁"
+        hours = hours_since_order(order, now)
+        if hours is not None:
+            title += f" · {'🔴' if hours >= 20 else '⏳'} {hours} sa"
+
+        lines = [title]
+
+        tracking = order.get("cargoTrackingNumber", "")
+        provider = order.get("cargoProviderName", "")
+        if tracking:
+            lines.append(f"🚚 {tracking}" + (f" · {provider}" if provider else ""))
+
+        for line in order.get("lines", []):
+            lines.append(format_product_line(line))
+
+        for note in notes_by_order.get(order_number, []):
+            short_note = note if len(note) <= 200 else note[:200].rstrip() + "…"
+            lines.append(f"📝 <i>{html_escape(short_note)}</i>")
+
+        blocks.append("\n".join(lines))
+
+    # Mesajı Telegram'ın uzunluk sınırını aşmayacak şekilde parçalara böl
+    messages = []
+    current = header
+    for block in blocks:
+        candidate = current + "\n" + block + "\n"
+        if len(candidate) > max_len and current != header:
+            messages.append(current)
+            current = "⏰ <b>(devamı)</b>\n\n" + block + "\n"
+        else:
+            current = candidate
+    messages.append(current)
+    return messages
+
 
 def fetch_unshipped_orders(cfg):
     """Henüz kargoya verilmemiş (Created/Picking/Invoiced durumundaki)
@@ -638,72 +740,59 @@ def process_shipped_confirmations(cfg, state, updates):
 
 
 def send_unshipped_reminders(cfg, state):
-    """Şu anki saate/moda göre gerekiyorsa, kargoya verilmemiş siparişler için
-    hatırlatma gönderir.
-    - 'once' modunda (10:30 açılış hatırlatması), her sipariş için günde
-      SADECE BİR KERE gönderilir.
-    - 'interval' modunda (14:00-15:00 ve 15:00-16:30), her sipariş için
-      belirtilen dakika aralığında tekrar gönderilir.
-    ÖNEMLİ: Telegram'daki 'Kargoya Verdim' buton tıklamaları/mesajları,
-    saat/mod ne olursa olsun HER ÇALIŞTIRMADA kontrol edilir (bu satırlar
-    kasıtlı olarak saat kontrolünden ÖNCE duruyor) — böylece biri butona
-    hatırlatma saatleri dışında basarsa bile anında işlenir."""
-    # Önce Telegram grubunda yeni "Kargoya Verdim" onayı var mı diye bak
-    # (saat/mod farketmeksizin, her zaman kontrol edilir)
+    """Kargoya verilmemiş siparişler için, saate göre gerekiyorsa TEK BİR TOPLU
+    hatırlatma mesajı gönderir (her sipariş için ayrı mesaj atmaz).
+    - 'once' modunda (10:30-14:00): o gün henüz hatırlatılmamış siparişler
+      için, günde bir kere.
+    - 'interval' modunda (14:00-15:00 ve 15:00-16:30): belirtilen dakika
+      aralığında, TÜM bekleyen siparişlerin güncel listesi.
+    ÖNEMLİ: Telegram'daki buton/klavye tıklamaları saat/mod ne olursa olsun
+    HER ÇALIŞTIRMADA kontrol edilir (kasıtlı olarak saat kontrolünden ÖNCE)."""
+    # Önce Telegram grubunda yeni "Kargo Çıktı" onayı var mı diye bak
     updates = get_telegram_updates(cfg, state)
     process_shipped_confirmations(cfg, state, updates)
 
     now = now_tr()
     confirmed = set(str(x) for x in state.get("shipped_confirmed_orders", []))
 
-    # Özel klavyeyi HER ZAMAN güncel tut (saat/mod farketmeksizin) —
-    # biri butona basıp onaylayınca, klavyedeki o buton hemen kaybolsun diye.
+    # Bekleyen (kargolanmamış ve henüz onaylanmamış) siparişler
     unshipped = fetch_unshipped_orders(cfg)
-    pending_orders_info = [
+    pending_orders = [
+        o for o in unshipped
+        if str(o.get("orderNumber", "")) and str(o.get("orderNumber", "")) not in confirmed
+    ]
+
+    # Özel klavyeyi HER ZAMAN güncel tut (saat/mod farketmeksizin)
+    sync_reply_keyboard(cfg, state, [
         (
             str(o.get("orderNumber", "")),
             f"{o.get('customerFirstName','')} {o.get('customerLastName','')}".strip(),
         )
-        for o in unshipped
-        if str(o.get("orderNumber", "")) and str(o.get("orderNumber", "")) not in confirmed
-    ]
-    sync_reply_keyboard(cfg, state, pending_orders_info)
+        for o in pending_orders
+    ])
 
     mode, interval = get_reminder_mode(now)
-    if mode == "none":
+    if mode == "none" or not pending_orders:
         return 0
 
-    sent_count = 0
+    orders_to_send = []
 
     if mode == "once":
         today_str = now.strftime("%Y-%m-%d")
         already_sent_today = set(state.get("morning_reminder_sent", {}).get(today_str, []))
-
-        for order in unshipped:
-            order_number = str(order.get("orderNumber", ""))
-            if not order_number or order_number in confirmed or order_number in already_sent_today:
-                continue
-            send_telegram_message(
-                cfg,
-                format_unshipped_reminder(order, now),
-                reply_markup=build_shipped_button(order_number),
-            )
-            already_sent_today.add(order_number)
-            sent_count += 1
-            time.sleep(1)
-
+        orders_to_send = [
+            o for o in pending_orders
+            if str(o.get("orderNumber", "")) not in already_sent_today
+        ]
+        if not orders_to_send:
+            return 0
+        for o in orders_to_send:
+            already_sent_today.add(str(o.get("orderNumber", "")))
         # Sadece bugünün kaydını tutuyoruz, eski günleri temizliyoruz
         state["morning_reminder_sent"] = {today_str: list(already_sent_today)}
-        return sent_count
 
-    # mode == "interval"
-    last_reminders = state.get("last_unshipped_reminder", {})
-    for order in unshipped:
-        order_number = str(order.get("orderNumber", ""))
-        if not order_number or order_number in confirmed:
-            continue
-
-        last_str = last_reminders.get(order_number)
+    else:  # mode == "interval"
+        last_str = state.get("last_interval_reminder")
         due = True
         if last_str:
             try:
@@ -711,19 +800,19 @@ def send_unshipped_reminders(cfg, state):
                 due = (now - last_dt) >= timedelta(minutes=interval)
             except Exception:
                 due = True
+        if not due:
+            return 0
+        orders_to_send = pending_orders
+        state["last_interval_reminder"] = now.isoformat()
 
-        if due:
-            send_telegram_message(
-                cfg,
-                format_unshipped_reminder(order, now),
-                reply_markup=build_shipped_button(order_number),
-            )
-            last_reminders[order_number] = now.isoformat()
-            sent_count += 1
-            time.sleep(1)
+    notes_by_order = collect_order_notes(
+        cfg, [str(o.get("orderNumber", "")) for o in orders_to_send]
+    )
+    for message in format_unshipped_summary(orders_to_send, notes_by_order, now):
+        send_telegram_message(cfg, message)
+        time.sleep(1)
 
-    state["last_unshipped_reminder"] = last_reminders
-    return sent_count
+    return len(orders_to_send)
 
 
 # ---------------------------------------------------------------------------
