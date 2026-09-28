@@ -495,13 +495,14 @@ def format_unshipped_reminder(order, now):
 # ---------------------------------------------------------------------------
 
 def fetch_unshipped_orders(cfg):
-    """Bugün için henüz kargoya verilmemiş (Created/Picking/Invoiced durumundaki)
-    siparişleri çeker."""
+    """Henüz kargoya verilmemiş (Created/Picking/Invoiced durumundaki)
+    siparişleri çeker. SON 7 GÜN içindeki tüm siparişlere bakar — böylece
+    dünden (ya da önceki günlerden) kalan, hâlâ kargolanmamış siparişler de
+    gece yarısı geçince kaybolmaz."""
     seller_id = cfg["trendyol"]["seller_id"]
     url = f"{TRENDYOL_BASE}/order/sellers/{seller_id}/orders"
 
-    start_of_day = datetime.combine(now_tr().date(), datetime.min.time())
-    start_ts = int(start_of_day.timestamp() * 1000)
+    start_ts = int((now_tr() - timedelta(days=7)).timestamp() * 1000)
     end_ts = int(now_tr().timestamp() * 1000)
 
     all_orders = {}
